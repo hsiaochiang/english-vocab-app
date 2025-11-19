@@ -8,110 +8,62 @@ import io
 import os
 
 # 設定頁面配置
-st.set_page_config(page_title="學測英文單字聽力生成器 v8.0 (診斷版)", layout="wide")
+st.set_page_config(page_title="學測英文單字聽力生成器 v9.0", layout="wide")
 
-def is_candidate_word(text):
-    """
-    判斷一行字是否像英文單字
-    """
-    if not text: return False
-    # 移除常見雜訊
-    text = text.strip()
-    # 排除數字、年份、頁碼、Level
-    if re.match(r'^[\d\s~]+$', text): return False
-    if "Level" in text or "Page" in text: return False
-    # 必須包含英文字母
-    if not re.search(r'[a-zA-Z]', text): return False
-    # 不能包含太多中文 (容許少量，例如音標可能有亂碼)
-    if len(re.findall(r'[\u4e00-\u9fff]', text)) > 0: return False
-    
-    return True
-
-# --- 核心功能 1: 解析 PDF (v8 暴力版) ---
+# --- 核心功能 1: 解析 PDF (v9 亂碼倖存版) ---
 @st.cache_data
 def parse_pdf(pdf_path):
+    """
+    解析學測單字 PDF。
+    v9修正：針對中文解釋變成 '○○○' 的情況，改用純英文特徵抓取。
+    """
     data = []
-    debug_logs = [] 
-    raw_text_sample = [] # 用來診斷
     
     if not os.path.exists(pdf_path):
-        return pd.DataFrame(), ["錯誤：找不到 PDF 檔案"], []
+        return pd.DataFrame()
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            total_pages = len(pdf.pages)
-            debug_logs.append(f"PDF 共有 {total_pages} 頁")
-
-            for p_idx, page in enumerate(pdf.pages):
+            for page in pdf.pages:
                 text = page.extract_text()
-                if not text: 
-                    debug_logs.append(f"Page {p_idx+1}: 無法提取文字")
-                    continue
+                if not text: continue
                 
-                # 存前3頁的樣本給使用者看
-                if p_idx < 3:
-                    raw_text_sample.append(f"--- Page {p_idx+1} ---\n{text[:500]}...\n(下略)")
-
                 lines = text.split('\n')
                 
-                # 1. 抓取頻率
+                # 1. 抓取頻率 (嘗試抓取，若無則預設)
                 current_freq = 0
-                freq_match = re.search(r'出現次數\s*[:：]\s*(\d+)', text)
+                freq_match = re.search(r'出現次數.*[:：]\s*(\d+)', text)
                 if freq_match:
                     current_freq = int(freq_match.group(1))
                 
-                # 2. 逐行掃描
-                # 這次我們不依賴括號 []，只要有詞性縮寫就抓
-                pos_keywords = [
-                    r'v\.', r'n\.', r'adj\.', r'adv\.', r'prep\.', r'conj\.', 
-                    r'pron\.', r'aux\.', r'art\.', r'num\.', r'int\.', r'pl\.'
-                ]
-                # 組合 Regex: 只要包含 "v." 且後面有中文或分號
-                pos_pattern = r'(' + '|'.join(pos_keywords) + r').*([\u4e00-\u9fff]|;)'
-                
-                for i, line in enumerate(lines):
+                for line in lines:
                     line = line.strip()
                     if not line: continue
-                    
-                    # 判斷是否為解釋行
-                    is_def_line = re.search(pos_pattern, line, re.IGNORECASE)
-                    
-                    if is_def_line:
-                        word = None
-                        definition = line
-                        
-                        # 策略 A: 單字在同一行 (例如: "apple n. 蘋果")
-                        # 切割點：第一個詞性出現的地方
-                        split_match = re.search(r'\b(' + '|'.join(pos_keywords) + r')', line, re.IGNORECASE)
-                        if split_match and split_match.start() > 1:
-                            potential_word = line[:split_match.start()].strip()
-                            if is_candidate_word(potential_word):
-                                word = potential_word
-                                definition = line[split_match.start():]
-                        
-                        # 策略 B: 單字在上一行
-                        if not word and i > 0:
-                            prev_line = lines[i-1].strip()
-                            if is_candidate_word(prev_line):
-                                word = prev_line
-                        
-                        # 策略 C: 單字在上上一行 (中間夾雜訊)
-                        if not word and i > 1:
-                            prev_prev = lines[i-2].strip()
-                            if is_candidate_word(prev_prev):
-                                word = prev_prev
 
-                        if word:
-                            # 清理單字 (去掉前後標點)
-                            word = re.sub(r'^[^a-zA-Z]+|[^a-zA-Z]+$', '', word)
-                            
-                            # 提取年份 (從解釋行或上下文找)
+                    # 過濾掉明顯不是單字的行
+                    # 1. 過濾掉年份行 (例如: 05 06 07 08)
+                    if re.match(r'^[\d\s~]+$', line): continue
+                    # 2. 過濾掉標題行
+                    if "Level" in line or "Page" in line or "出現次數" in line or "The following" in line: continue
+                    if "學測版" in line or "高頻率單字表" in line or "尊重著作權" in line: continue
+                    
+                    # 3. 核心判斷：這行是以英文字母開頭嗎？
+                    # 許多單字行長這樣: "passage ○○○" 或 "unique"
+                    # 我們抓取開頭的英文字
+                    word_match = re.match(r'^([a-zA-Z\-\'’]+)', line)
+                    
+                    if word_match:
+                        word = word_match.group(1).strip()
+                        
+                        # 二次確認：單字長度要大於 1 (避免抓到雜訊)
+                        if len(word) > 1:
+                            # 嘗試抓取年份 (從同一行找)
                             years_found = re.findall(r'\b(0[5-9]|1[0-4])\b', line)
-                            if i < len(lines)-1:
-                                years_found += re.findall(r'\b(0[5-9]|1[0-4])\b', lines[i+1])
-                                
                             years_list = [int(y) + 100 for y in years_found]
                             years_list = sorted(list(set(years_list)))
+                            
+                            # 因為中文變成了 ○○○，我們給一個預設解釋
+                            definition = "詳見 PDF (文字編碼限制)"
                             
                             data.append({
                                 "Word": word,
@@ -120,13 +72,18 @@ def parse_pdf(pdf_path):
                                 "Years": years_list,
                                 "Year_Str": ", ".join(map(str, years_list)) if years_list else "-"
                             })
-
-            debug_logs.append(f"解析完成，共提取 {len(data)} 個單字")
             
     except Exception as e:
-        return pd.DataFrame(), [f"發生未預期的錯誤: {str(e)}"], []
+        # 出錯時回傳空，讓主程式處理
+        print(f"Error: {e}")
+        return pd.DataFrame()
 
-    return pd.DataFrame(data), debug_logs, raw_text_sample
+    # 去除重複單字 (保留第一次出現的)
+    df = pd.DataFrame(data)
+    if not df.empty:
+        df = df.drop_duplicates(subset=['Word'], keep='first')
+        
+    return df
 
 # --- 核心功能 2: 合併音訊 ---
 def combine_audio(playlist_df, silence_duration):
@@ -140,6 +97,7 @@ def combine_audio(playlist_df, silence_duration):
     for i, row in playlist_df.iterrows():
         word = row['Word']
         try:
+            # 生成英文發音
             tts = gTTS(text=word, lang='en')
             mp3_fp = io.BytesIO()
             tts.write_to_fp(mp3_fp)
@@ -156,7 +114,8 @@ def combine_audio(playlist_df, silence_duration):
 
 # --- 主程式介面 ---
 
-st.title("🎧 學測英文單字聽力生成器 v8.0 (診斷版)")
+st.title("🎧 學測英文單字聽力生成器 v9.0")
+st.markdown("⚠️ **注意**：由於 PDF 文字編碼特殊，中文解釋可能無法顯示，但**英文朗讀功能完全正常**。")
 
 # 1. 檔案讀取
 default_pdf = "vocabulary.pdf"
@@ -175,26 +134,12 @@ status_container = st.container()
 
 if target_file:
     # 開始解析
-    df, logs, raw_samples = parse_pdf(target_file)
+    df = parse_pdf(target_file)
     
     # 如果解析失敗或沒有資料
     if df.empty:
         status_container.error("⚠️ 檔案已讀取，但未解析到任何單字。")
-        
-        st.warning("👇 請務必截圖以下內容，這能幫助我們找出原因：")
-        with st.expander("🔍 診斷報告 (Raw Text Samples)", expanded=True):
-            st.write("### 系統讀到的 PDF 原始文字內容：")
-            if raw_samples:
-                for sample in raw_samples:
-                    st.text(sample)
-                    st.markdown("---")
-            else:
-                st.write("無法讀取任何文字內容 (可能是加密或純圖片 PDF)")
-                
-        with st.expander("查看詳細除錯紀錄 (Debug Log)"):
-            for log in logs:
-                st.write(log)
-        
+        st.info("這可能是因為 PDF 格式過於特殊。")
     else:
         status_container.success(f"✅ 成功載入！共發現 {len(df)} 個單字。")
         
@@ -211,6 +156,7 @@ if target_file:
         if filter_mode == "依序挑選 (Sequential)":
             page_size = 20
             max_page = (len(df) // page_size) + 1
+            if max_page < 1: max_page = 1
             page_num = st.sidebar.number_input(f"選擇頁數 (每頁20字, 共{max_page}頁)", min_value=1, max_value=max_page, value=1)
             start_idx = (page_num - 1) * page_size
             filtered_df = df.iloc[start_idx : start_idx + page_size]
@@ -237,7 +183,12 @@ if target_file:
                 filtered_df = filtered_df[filtered_df['Word'].str.startswith(selected_letter, na=False)]
 
             # 年份篩選
-            all_years = sorted(list(set([y for sublist in df['Years'] for y in sublist])))
+            # 這裡需要處理 flatten
+            all_years = []
+            for sublist in df['Years']:
+                all_years.extend(sublist)
+            all_years = sorted(list(set(all_years)))
+            
             year_input = st.sidebar.selectbox("出現年份 (民國)", ["All"] + all_years)
             if year_input != "All":
                 filtered_df = filtered_df[filtered_df['Years'].apply(lambda x: year_input in x)]
