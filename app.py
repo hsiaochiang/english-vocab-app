@@ -8,16 +8,18 @@ import io
 import os
 
 # 設定頁面配置
-st.set_page_config(page_title="學測英文單字聽力生成器 v5.0", layout="wide")
+st.set_page_config(page_title="學測英文單字聽力生成器 v6.0", layout="wide")
 
-# --- 核心功能 1: 解析 PDF (v5 跨行合併版) ---
+# --- 核心功能 1: 解析 PDF (v6 全文掃描版) ---
 @st.cache_data
 def parse_pdf(pdf_path):
     """
     解析學測單字 PDF。
-    v5修正：
-    1. 加入「跨行合併」邏輯，解決單字與解釋分在不同行的問題。
-    2. 增強年份 (05-14) 的提取範圍。
+    v6 修正：放棄表格偵測，改用「全文行掃描 (Text Line Parsing)」。
+    邏輯：
+    1. 逐行讀取文字。
+    2. 遇到「純英文行」 -> 暫存為候選單字。
+    3. 遇到「詞性標記行 ([n.]...)」 -> 將暫存單字與此行合併為一筆資料。
     """
     data = []
     debug_logs = [] 
@@ -31,108 +33,76 @@ def parse_pdf(pdf_path):
             debug_logs.append(f"PDF 共有 {total_pages} 頁")
 
             for p_idx, page in enumerate(pdf.pages):
-                text = page.extract_text() or ""
+                # 使用 extract_text 獲取純文字，這比 extract_tables 穩定得多
+                text = page.extract_text()
+                if not text:
+                    continue
                 
-                # 1. 抓取頻率
+                lines = text.split('\n')
+                
+                # 1. 抓取頻率 (出現次數)
                 current_freq = 0
                 freq_match = re.search(r'出現次數\s*[:：]\s*(\d+)', text)
                 if freq_match:
                     current_freq = int(freq_match.group(1))
                 
-                # 2. 提取表格 (使用文字流策略，對這種排版較有效)
-                tables = page.extract_tables(table_settings={
-                    "vertical_strategy": "text", 
-                    "horizontal_strategy": "text",
-                    "snap_tolerance": 5
-                })
+                # 2. 逐行掃描狀態機
+                pending_word = None
                 
-                if not tables:
-                    # 回退到預設策略
-                    tables = page.extract_tables()
-
-                if not tables:
-                    continue
-
-                # 3. 處理表格內容 (跨行邏輯)
-                pending_word = None # 用來暫存「只有單字沒解釋」的那一行
+                # 定義詞性 Regex (用來鎖定「解釋行」)
+                pos_pattern = r'\[\s*(v\.|n\.|adj\.|adv\.|prep\.|conj\.|pron\.|aux\.|art\.|num\.|int\.|pl\.|缩写|縮寫)'
                 
-                for table in tables:
-                    for row in table:
-                        # 清理 row
-                        row = [str(cell).replace('\n', ' ').strip() if cell is not None else "" for cell in row]
+                for line in lines:
+                    line = line.strip()
+                    if not line: continue
+                    
+                    # 判斷 A: 這行包含詞性標記 => 這是「解釋行」
+                    match = re.search(pos_pattern, line, re.IGNORECASE)
+                    if match:
+                        word_part = ""
+                        def_part = ""
                         
-                        # 詞性 Regex
-                        pos_pattern = r'\[\s*(v\.|n\.|adj\.|adv\.|prep\.|conj\.|pron\.|aux\.|art\.|num\.|int\.|pl\.|缩写|縮寫)'
+                        # 狀況 1: 單字跟解釋在同一行 (e.g. "apple [n.] 蘋果")
+                        if match.start() > 1:
+                            potential_word = line[:match.start()].strip()
+                            # 檢查前面那段是不是純英文
+                            if re.match(r"^[a-zA-Z\s\-\.\'’]+$", potential_word) and len(potential_word) > 1:
+                                word_part = potential_word
+                                def_part = line[match.start():]
                         
-                        word = ""
-                        definition = ""
-                        def_index = -1
+                        # 狀況 2: 這行只有解釋，單字在上一行 (pending_word)
+                        if not word_part and pending_word:
+                            word_part = pending_word
+                            def_part = line
+                            pending_word = None # 配對成功，清空暫存
 
-                        # A. 先找定義
-                        for i, cell in enumerate(row):
-                            match = re.search(pos_pattern, cell, re.IGNORECASE)
-                            if match:
-                                def_index = i
-                                # 檢查是否黏在一起 (e.g. "apple [n.]...")
-                                if match.start() > 2:
-                                    raw_word = cell[:match.start()].strip()
-                                    raw_def = cell[match.start():].strip()
-                                    if re.match(r"^[a-zA-Z\s\-\.\'’]+$", raw_word):
-                                        word = raw_word
-                                        definition = raw_def
-                                else:
-                                    definition = cell
-                                break
-                        
-                        # B. 如果找到定義
-                        if def_index >= 0:
-                            # 如果這行自己就有單字 (往左找)
-                            if not word:
-                                for j in range(def_index - 1, -1, -1):
-                                    candidate = row[j]
-                                    if "Level" in candidate: continue
-                                    # 寬鬆的單字檢查
-                                    if candidate and re.match(r"^[a-zA-Z\s\-\.\'’0-9]+$", candidate) and not re.match(r'^[\d\s~]+$', candidate):
-                                        word = candidate
-                                        break
-                            
-                            # 如果這行沒單字，但有「暫存的單字」 (Cross-row match!)
-                            if not word and pending_word:
-                                word = pending_word
-                                pending_word = None # 用掉就清空
-
-                        # C. 如果沒定義，但有可能是單字行 (儲存為 Pending)
-                        elif not word and not definition:
-                            # 掃描這一行，看有沒有像單字的
-                            for cell in row:
-                                # 排除年份、Level、空白、中文
-                                if not cell: continue
-                                if "Level" in cell: continue
-                                if re.match(r'^[\d\s~]+$', cell): continue # 排除 "08 09" 或 "10~7"
-                                if re.search(r'[\u4e00-\u9fff]', cell): continue # 排除中文標題
-                                
-                                # 這是單字的特徵：純英文、長度>1
-                                if re.match(r"^[a-zA-Z\s\-\.\'’]+$", cell) and len(cell) > 1:
-                                    pending_word = cell
-                                    break # 找到一個就夠了，假設它是單字，留給下一行配對
-                                    
-                        # D. 儲存資料
-                        if word and definition:
-                            # 提取年份 (從整行文字找)
-                            full_row_text = " ".join(row)
-                            years_found = re.findall(r'\b(0[5-9]|1[0-4])\b', full_row_text)
+                        # 如果成功配對出單字和解釋
+                        if word_part and def_part:
+                            # 提取年份 (在解釋行或單字行尋找 05-14)
+                            # 這裡簡單處理：通常年份會跟在後面，或者我們從整頁頻率判斷
+                            years_found = re.findall(r'\b(0[5-9]|1[0-4])\b', line)
                             years_list = [int(y) + 100 for y in years_found]
                             years_list = sorted(list(set(years_list)))
                             
                             data.append({
-                                "Word": word,
-                                "Definition": definition,
+                                "Word": word_part,
+                                "Definition": def_part,
                                 "Frequency": current_freq,
                                 "Years": years_list,
                                 "Year_Str": ", ".join(map(str, years_list)) if years_list else "-"
                             })
-                            # 成功配對後，清空 pending
-                            pending_word = None
+                        continue #這行處理完了，進入下一行
+
+                    # 判斷 B: 這行看起來像是「單字」 (純英文，不是標題)
+                    # 排除 "Level.3", "P1", 純數字, 包含中文的行
+                    if re.match(r"^[a-zA-Z\s\-\.\'’]+$", line):
+                        if "Level" in line or "Page" in line or "The following table" in line:
+                            continue
+                        if len(line) <= 1: # 排除單一字母雜訊
+                            continue
+                            
+                        # 是一個合法的候選單字，存起來等待下一行解釋
+                        pending_word = line
             
             debug_logs.append(f"解析完成，共提取 {len(data)} 個單字")
             
@@ -160,7 +130,7 @@ def combine_audio(playlist_df, silence_duration):
             word_sound = AudioSegment.from_file(mp3_fp, format="mp3")
             combined += word_sound + silence
         except Exception as e:
-            print(f"Error for {word}: {e}")
+            print(f"Error generating audio for {word}: {e}")
         
         my_bar.progress((i + 1) / total, text=f"正在合成: {word} ({i+1}/{total})")
             
@@ -169,7 +139,7 @@ def combine_audio(playlist_df, silence_duration):
 
 # --- 主程式介面 ---
 
-st.title("🎧 學測英文單字聽力生成器 v5.0 (跨行合併版)")
+st.title("🎧 學測英文單字聽力生成器 v6.0 (全文掃描版)")
 
 # 1. 檔案讀取
 default_pdf = "vocabulary.pdf"
@@ -196,17 +166,14 @@ if target_file:
         with st.expander("查看詳細除錯紀錄 (Debug Log)"):
             for log in logs:
                 st.write(log)
-            # ... (保留 debug info 方便您回報) ...
             st.write("---")
-            st.write("前 5 頁 Raw Data:")
+            st.write("前 2 頁純文字預覽 (Text Extract):")
             try:
                 with pdfplumber.open(target_file) as pdf:
-                    for i in range(min(5, len(pdf.pages))):
-                        st.write(f"Page {i+1}:")
-                        tables = pdf.pages[i].extract_tables(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
-                        if tables: st.write(tables[0][:3])
+                    for i in range(min(2, len(pdf.pages))):
+                        st.write(f"--- Page {i+1} ---")
+                        st.text(pdf.pages[i].extract_text())
             except: pass
-
     else:
         status_container.success(f"✅ 成功載入！共發現 {len(df)} 個單字。")
         
