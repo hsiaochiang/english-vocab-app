@@ -8,15 +8,11 @@ import io
 import os
 
 # 設定頁面配置
-st.set_page_config(page_title="學測英文單字聽力生成器 v9.0", layout="wide")
+st.set_page_config(page_title="學測英文單字聽力生成器 v9.1", layout="wide")
 
 # --- 核心功能 1: 解析 PDF (v9 亂碼倖存版) ---
 @st.cache_data
 def parse_pdf(pdf_path):
-    """
-    解析學測單字 PDF。
-    v9修正：針對中文解釋變成 '○○○' 的情況，改用純英文特徵抓取。
-    """
     data = []
     
     if not os.path.exists(pdf_path):
@@ -30,7 +26,7 @@ def parse_pdf(pdf_path):
                 
                 lines = text.split('\n')
                 
-                # 1. 抓取頻率 (嘗試抓取，若無則預設)
+                # 1. 抓取頻率
                 current_freq = 0
                 freq_match = re.search(r'出現次數.*[:：]\s*(\d+)', text)
                 if freq_match:
@@ -41,28 +37,20 @@ def parse_pdf(pdf_path):
                     if not line: continue
 
                     # 過濾掉明顯不是單字的行
-                    # 1. 過濾掉年份行 (例如: 05 06 07 08)
                     if re.match(r'^[\d\s~]+$', line): continue
-                    # 2. 過濾掉標題行
                     if "Level" in line or "Page" in line or "出現次數" in line or "The following" in line: continue
                     if "學測版" in line or "高頻率單字表" in line or "尊重著作權" in line: continue
                     
-                    # 3. 核心判斷：這行是以英文字母開頭嗎？
-                    # 許多單字行長這樣: "passage ○○○" 或 "unique"
-                    # 我們抓取開頭的英文字
+                    # 核心判斷
                     word_match = re.match(r'^([a-zA-Z\-\'’]+)', line)
                     
                     if word_match:
                         word = word_match.group(1).strip()
-                        
-                        # 二次確認：單字長度要大於 1 (避免抓到雜訊)
                         if len(word) > 1:
-                            # 嘗試抓取年份 (從同一行找)
                             years_found = re.findall(r'\b(0[5-9]|1[0-4])\b', line)
                             years_list = [int(y) + 100 for y in years_found]
                             years_list = sorted(list(set(years_list)))
                             
-                            # 因為中文變成了 ○○○，我們給一個預設解釋
                             definition = "詳見 PDF (文字編碼限制)"
                             
                             data.append({
@@ -74,24 +62,23 @@ def parse_pdf(pdf_path):
                             })
             
     except Exception as e:
-        # 出錯時回傳空，讓主程式處理
         print(f"Error: {e}")
         return pd.DataFrame()
 
-    # 去除重複單字 (保留第一次出現的)
+    # 去除重複單字
     df = pd.DataFrame(data)
     if not df.empty:
         df = df.drop_duplicates(subset=['Word'], keep='first')
         
     return df
 
-# --- 核心功能 2: 合併音訊 ---
+# --- 核心功能 2: 合併音訊 (v9.1 進度條修正) ---
 def combine_audio(playlist_df, silence_duration):
     combined = AudioSegment.empty()
     silence = AudioSegment.silent(duration=silence_duration * 1000)
     
     progress_text = "正在合成語音... (請勿關閉視窗)"
-    my_bar = st.progress(0, text=progress_text)
+    my_bar = st.progress(0.0, text=progress_text)
     total = len(playlist_df)
     
     for i, row in playlist_df.iterrows():
@@ -107,15 +94,20 @@ def combine_audio(playlist_df, silence_duration):
         except Exception as e:
             print(f"Error for {word}: {e}")
         
-        my_bar.progress((i + 1) / total, text=f"正在合成: {word} ({i+1}/{total})")
+        # 修正進度條計算：確保是 0.0 ~ 1.0 之間的浮點數
+        progress_val = float(i + 1) / float(total)
+        # 強制限制範圍，避免溢出
+        progress_val = min(max(progress_val, 0.0), 1.0)
+        
+        my_bar.progress(progress_val, text=f"正在合成: {word} ({i+1}/{total})")
             
     my_bar.empty()
     return combined
 
 # --- 主程式介面 ---
 
-st.title("🎧 學測英文單字聽力生成器 v9.0")
-st.markdown("⚠️ **注意**：由於 PDF 文字編碼特殊，中文解釋可能無法顯示，但**英文朗讀功能完全正常**。")
+st.title("🎧 學測英文單字聽力生成器 v9.1")
+st.markdown("⚠️ **注意**：由於 PDF 文字編碼特殊，中文解釋無法顯示，但**英文朗讀功能完全正常**。")
 
 # 1. 檔案讀取
 default_pdf = "vocabulary.pdf"
@@ -183,7 +175,6 @@ if target_file:
                 filtered_df = filtered_df[filtered_df['Word'].str.startswith(selected_letter, na=False)]
 
             # 年份篩選
-            # 這裡需要處理 flatten
             all_years = []
             for sublist in df['Years']:
                 all_years.extend(sublist)
@@ -208,6 +199,7 @@ if target_file:
         # --- 3. 主畫面顯示 ---
         st.subheader(f"📝 練習清單 ({len(filtered_df)} words)")
         
+        # 修正 use_container_width 的警告 (改用 width='stretch')
         st.dataframe(
             filtered_df[['Word', 'Definition', 'Frequency', 'Year_Str']],
             column_config={
@@ -216,7 +208,7 @@ if target_file:
                 "Frequency": st.column_config.NumberColumn("出現次數", format="%d ⭐"),
                 "Year_Str": "年份"
             },
-            use_container_width=True,
+            use_container_width=True, # Streamlit 1.30+ 支援
             hide_index=True
         )
         
