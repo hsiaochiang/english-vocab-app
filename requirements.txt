@@ -3,3 +3,4 @@ pandas
 pdfplumber
 gTTS
 pydub
+pyaudioop
