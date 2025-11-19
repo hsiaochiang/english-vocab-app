@@ -10,12 +10,12 @@ import os
 # 設定頁面配置
 st.set_page_config(page_title="會考英文單字聽力生成器 v3.0", layout="wide")
 
-# --- 核心功能 1: 解析 PDF (v3 強力版) ---
+# --- 核心功能 1: 解析 PDF (強力模式) ---
 @st.cache_data
 def parse_pdf(pdf_path):
     """
     解析會考單字 PDF。
-    v3修正：加入 'Stream' 模式 fallback，解決無格線表格無法讀取的問題。
+    包含 Stream 模式 fallback，解決無格線表格無法讀取的問題。
     """
     data = []
     debug_logs = [] 
@@ -31,7 +31,7 @@ def parse_pdf(pdf_path):
             for p_idx, page in enumerate(pdf.pages):
                 text = page.extract_text() or ""
                 
-                # 1. 抓取頻率 (出現次數)
+                # 1. 抓取頻率
                 current_freq = 0
                 freq_match = re.search(r'出現次數\s*[:：]\s*(\d+)', text)
                 if freq_match:
@@ -41,52 +41,43 @@ def parse_pdf(pdf_path):
                 tables = page.extract_tables()
                 
                 # 3. 提取表格 - 策略 B: Stream (找空白間距)
-                # 如果策略 A 失敗，改用策略 B
                 if not tables:
-                    # vertical_strategy="text" 會根據文字的垂直對齊來猜測欄位
                     tables = page.extract_tables(table_settings={
                         "vertical_strategy": "text", 
                         "horizontal_strategy": "text",
                         "snap_tolerance": 5
                     })
                     if tables:
-                        debug_logs.append(f"頁面 {p_idx+1}: 啟用強力模式 (Stream Mode) 成功抓取表格")
+                        debug_logs.append(f"頁面 {p_idx+1}: 啟用強力模式 (Stream Mode)")
                 
                 if not tables:
-                    if "出現次數" in text:
-                         debug_logs.append(f"頁面 {p_idx+1}: 仍無法偵測到表格 (跳過)")
                     continue
 
-                # 4. 處理抓到的表格內容
+                # 4. 處理表格內容
                 for table in tables:
                     for row in table:
-                        # 清理 row (移除 None 和換行)
+                        # 清理 row
                         row = [str(cell).replace('\n', ' ').strip() if cell is not None else "" for cell in row]
                         
-                        # 跳過太短或全空的行
                         if not any(row) or len(row) < 2: 
                             continue
 
                         word = ""
                         definition = ""
                         
-                        # 尋找定義欄位 (通常包含詞性 [v.] [n.] 等)
+                        # 尋找定義欄位
                         def_index = -1
                         for i, cell in enumerate(row):
-                            # 寬鬆匹配詞性標記
                             if re.search(r'\[\s*(v\.|n\.|adj\.|adv\.|prep\.|conj\.|pron\.|aux\.|art\.|num\.|缩写|縮寫)', cell, re.IGNORECASE):
                                 def_index = i
                                 definition = cell
                                 break
                         
-                        # 如果找到定義
+                        # 如果找到定義，往前找單字
                         if def_index > 0:
-                            # 嘗試在定義欄位的「左側」尋找單字
-                            # 往左搜尋直到找到看起來像單字的欄位
                             potential_word = ""
                             for j in range(def_index - 1, -1, -1):
                                 txt = row[j]
-                                # 檢查是否為純英文 (允許連字號和空格) 且長度大於1
                                 if re.match(r'^[a-zA-Z\-\s\.]+$', txt) and len(txt) > 1:
                                     potential_word = txt
                                     break
@@ -94,7 +85,7 @@ def parse_pdf(pdf_path):
                             if potential_word:
                                 word = potential_word.strip()
                                 
-                                # 提取年份 (尋找 05-14)
+                                # 提取年份
                                 full_row_text = " ".join(row)
                                 years_found = re.findall(r'\b(0[5-9]|1[0-4])\b', full_row_text)
                                 years_list = [int(y) + 100 for y in years_found]
@@ -126,6 +117,7 @@ def combine_audio(playlist_df, silence_duration):
     
     for i, row in playlist_df.iterrows():
         word = row['Word']
+        # 這裡就是您之前報錯的地方，try 必須對應 except
         try:
             tts = gTTS(text=word, lang='en')
             mp3_fp = io.BytesIO()
@@ -134,7 +126,7 @@ def combine_audio(playlist_df, silence_duration):
             word_sound = AudioSegment.from_file(mp3_fp, format="mp3")
             combined += word_sound + silence
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error generating audio for {word}: {e}")
         
         my_bar.progress((i + 1) / total, text=f"正在合成: {word} ({i+1}/{total})")
             
@@ -193,7 +185,7 @@ if target_file:
             filtered_df = df.iloc[start_idx : start_idx + page_size]
             
         elif filter_mode == "自訂篩選 (Advanced)":
-            # 頻率篩選 (檢查是否有 Frequency 資料)
+            # 頻率篩選
             if df['Frequency'].sum() > 0:
                 freq_options = st.sidebar.multiselect(
                     "頻率等級 (Stars)",
@@ -230,35 +222,4 @@ if target_file:
         # 間隔設定
         silence_sec = st.sidebar.selectbox("單字間隔時間 (秒)", [5, 10, 15])
 
-        # --- 3. 主畫面顯示 ---
-        st.subheader(f"📝 練習清單 ({len(filtered_df)} words)")
-        
-        st.dataframe(
-            filtered_df[['Word', 'Definition', 'Frequency', 'Year_Str']],
-            column_config={
-                "Word": "單字",
-                "Definition": "中文解釋",
-                "Frequency": st.column_config.NumberColumn("出現次數", format="%d ⭐"),
-                "Year_Str": "年份"
-            },
-            use_container_width=True,
-            hide_index=True
-        )
-        
-        # --- 4. 生成音訊 ---
-        st.divider()
-        if st.button("▶️ 生成語音播放清單", type="primary"):
-            if filtered_df.empty:
-                st.error("清單為空，請調整篩選條件。")
-            else:
-                audio_segment = combine_audio(filtered_df, silence_sec)
-                buffer = io.BytesIO()
-                audio_segment.export(buffer, format="mp3")
-                buffer.seek(0)
-                
-                st.success("生成完畢！")
-                st.audio(buffer, format='audio/mp3')
-                st.download_button("📥 下載 MP3", data=buffer, file_name="vocab_playlist.mp3", mime="audio/mp3")
-
-else:
-    st.info("請上傳 PDF 檔案以開始使用。")
+        # --- 3. 主畫面
