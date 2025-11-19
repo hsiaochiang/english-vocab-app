@@ -8,37 +8,34 @@ import io
 import os
 
 # 設定頁面配置
-st.set_page_config(page_title="學測英文單字聽力生成器 v7.0 (錨點搜尋版)", layout="wide")
+st.set_page_config(page_title="學測英文單字聽力生成器 v8.0 (診斷版)", layout="wide")
 
-def clean_word_candidate(text):
+def is_candidate_word(text):
     """
-    清理候選文字，移除年份數字、中文、標點，只留下最像單字的英文。
+    判斷一行字是否像英文單字
     """
-    if not text: return None
-    # 移除年份數字 (例如 05 06 10)
-    text_no_digits = re.sub(r'\d+', '', text)
-    # 移除中文
-    text_no_chinese = re.sub(r'[\u4e00-\u9fff]', '', text_no_digits)
+    if not text: return False
     # 移除常見雜訊
-    clean_text = text_no_chinese.replace("Level", "").replace("Page", "").strip()
+    text = text.strip()
+    # 排除數字、年份、頁碼、Level
+    if re.match(r'^[\d\s~]+$', text): return False
+    if "Level" in text or "Page" in text: return False
+    # 必須包含英文字母
+    if not re.search(r'[a-zA-Z]', text): return False
+    # 不能包含太多中文 (容許少量，例如音標可能有亂碼)
+    if len(re.findall(r'[\u4e00-\u9fff]', text)) > 0: return False
     
-    # 尋找最長的連續英文字串 (支援連字號 - 和單引號 ')
-    # 例如 "05 06 access" -> 抓出 "access"
-    match = re.search(r"([a-zA-Z\-\'’\s]+)", clean_text)
-    if match:
-        word = match.group(1).strip()
-        if len(word) > 1: # 排除單一字母雜訊
-            return word
-    return None
+    return True
 
-# --- 核心功能 1: 解析 PDF (v7 錨點搜尋版) ---
+# --- 核心功能 1: 解析 PDF (v8 暴力版) ---
 @st.cache_data
 def parse_pdf(pdf_path):
     data = []
     debug_logs = [] 
+    raw_text_sample = [] # 用來診斷
     
     if not os.path.exists(pdf_path):
-        return pd.DataFrame(), ["錯誤：找不到 PDF 檔案"]
+        return pd.DataFrame(), ["錯誤：找不到 PDF 檔案"], []
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -47,8 +44,14 @@ def parse_pdf(pdf_path):
 
             for p_idx, page in enumerate(pdf.pages):
                 text = page.extract_text()
-                if not text: continue
+                if not text: 
+                    debug_logs.append(f"Page {p_idx+1}: 無法提取文字")
+                    continue
                 
+                # 存前3頁的樣本給使用者看
+                if p_idx < 3:
+                    raw_text_sample.append(f"--- Page {p_idx+1} ---\n{text[:500]}...\n(下略)")
+
                 lines = text.split('\n')
                 
                 # 1. 抓取頻率
@@ -57,66 +60,73 @@ def parse_pdf(pdf_path):
                 if freq_match:
                     current_freq = int(freq_match.group(1))
                 
-                # 定義詞性錨點 (這是我們最可靠的特徵)
-                # 包含常見縮寫: v. n. adj. adv. prep. conj. pron. aux. art. num. int.
-                anchor_pattern = r'(\[\s*(v\.|n\.|adj\.|adv\.|prep\.|conj\.|pron\.|aux\.|art\.|num\.|int\.|pl\.|缩写|縮寫).*)'
+                # 2. 逐行掃描
+                # 這次我們不依賴括號 []，只要有詞性縮寫就抓
+                pos_keywords = [
+                    r'v\.', r'n\.', r'adj\.', r'adv\.', r'prep\.', r'conj\.', 
+                    r'pron\.', r'aux\.', r'art\.', r'num\.', r'int\.', r'pl\.'
+                ]
+                # 組合 Regex: 只要包含 "v." 且後面有中文或分號
+                pos_pattern = r'(' + '|'.join(pos_keywords) + r').*([\u4e00-\u9fff]|;)'
                 
                 for i, line in enumerate(lines):
-                    # 搜尋這一行是否有詞性標記
-                    match = re.search(anchor_pattern, line, re.IGNORECASE)
+                    line = line.strip()
+                    if not line: continue
                     
-                    if match:
-                        # 找到錨點了！
-                        definition_part = match.group(1) # 抓出 "[n.] 之後的所有文字"
-                        
+                    # 判斷是否為解釋行
+                    is_def_line = re.search(pos_pattern, line, re.IGNORECASE)
+                    
+                    if is_def_line:
                         word = None
+                        definition = line
                         
-                        # 策略 A: 單字在同一行，位於詞性標記的左邊
-                        # 例如: "access [n.] 通道"
-                        prefix_text = line[:match.start()]
-                        word = clean_word_candidate(prefix_text)
+                        # 策略 A: 單字在同一行 (例如: "apple n. 蘋果")
+                        # 切割點：第一個詞性出現的地方
+                        split_match = re.search(r'\b(' + '|'.join(pos_keywords) + r')', line, re.IGNORECASE)
+                        if split_match and split_match.start() > 1:
+                            potential_word = line[:split_match.start()].strip()
+                            if is_candidate_word(potential_word):
+                                word = potential_word
+                                definition = line[split_match.start():]
                         
                         # 策略 B: 單字在上一行
-                        # 例如: 
-                        # "access"
-                        # "[n.] 通道"
-                        # 或者 "05 06 access" (有年份雜訊)
                         if not word and i > 0:
-                            prev_line = lines[i-1]
-                            word = clean_word_candidate(prev_line)
-                            
-                        # 策略 C: 極端情況，單字在上上一行 (中間夾了年份行)
+                            prev_line = lines[i-1].strip()
+                            if is_candidate_word(prev_line):
+                                word = prev_line
+                        
+                        # 策略 C: 單字在上上一行 (中間夾雜訊)
                         if not word and i > 1:
-                            prev_prev_line = lines[i-2]
-                            # 確保上一行看起來像是年份或無意義的雜訊
-                            if re.search(r'\d+', lines[i-1]) or not lines[i-1].strip():
-                                word = clean_word_candidate(prev_prev_line)
+                            prev_prev = lines[i-2].strip()
+                            if is_candidate_word(prev_prev):
+                                word = prev_prev
 
-                        if word and definition_part:
-                            # 提取年份 (尋找附近行的 05-14)
-                            # 我們搜尋當前行 + 上一行 + 下一行
-                            context_text = line
-                            if i > 0: context_text += " " + lines[i-1]
-                            if i < len(lines) - 1: context_text += " " + lines[i+1]
+                        if word:
+                            # 清理單字 (去掉前後標點)
+                            word = re.sub(r'^[^a-zA-Z]+|[^a-zA-Z]+$', '', word)
                             
-                            years_found = re.findall(r'\b(0[5-9]|1[0-4])\b', context_text)
+                            # 提取年份 (從解釋行或上下文找)
+                            years_found = re.findall(r'\b(0[5-9]|1[0-4])\b', line)
+                            if i < len(lines)-1:
+                                years_found += re.findall(r'\b(0[5-9]|1[0-4])\b', lines[i+1])
+                                
                             years_list = [int(y) + 100 for y in years_found]
                             years_list = sorted(list(set(years_list)))
                             
                             data.append({
                                 "Word": word,
-                                "Definition": definition_part,
+                                "Definition": definition,
                                 "Frequency": current_freq,
                                 "Years": years_list,
                                 "Year_Str": ", ".join(map(str, years_list)) if years_list else "-"
                             })
-            
+
             debug_logs.append(f"解析完成，共提取 {len(data)} 個單字")
             
     except Exception as e:
-        return pd.DataFrame(), [f"發生未預期的錯誤: {str(e)}"]
+        return pd.DataFrame(), [f"發生未預期的錯誤: {str(e)}"], []
 
-    return pd.DataFrame(data), debug_logs
+    return pd.DataFrame(data), debug_logs, raw_text_sample
 
 # --- 核心功能 2: 合併音訊 ---
 def combine_audio(playlist_df, silence_duration):
@@ -146,7 +156,7 @@ def combine_audio(playlist_df, silence_duration):
 
 # --- 主程式介面 ---
 
-st.title("🎧 學測英文單字聽力生成器 v7.0 (最終版)")
+st.title("🎧 學測英文單字聽力生成器 v8.0 (診斷版)")
 
 # 1. 檔案讀取
 default_pdf = "vocabulary.pdf"
@@ -165,15 +175,25 @@ status_container = st.container()
 
 if target_file:
     # 開始解析
-    df, logs = parse_pdf(target_file)
+    df, logs, raw_samples = parse_pdf(target_file)
     
     # 如果解析失敗或沒有資料
     if df.empty:
         status_container.error("⚠️ 檔案已讀取，但未解析到任何單字。")
+        
+        st.warning("👇 請務必截圖以下內容，這能幫助我們找出原因：")
+        with st.expander("🔍 診斷報告 (Raw Text Samples)", expanded=True):
+            st.write("### 系統讀到的 PDF 原始文字內容：")
+            if raw_samples:
+                for sample in raw_samples:
+                    st.text(sample)
+                    st.markdown("---")
+            else:
+                st.write("無法讀取任何文字內容 (可能是加密或純圖片 PDF)")
+                
         with st.expander("查看詳細除錯紀錄 (Debug Log)"):
             for log in logs:
                 st.write(log)
-        st.info("請確認您的 PDF 是否為純圖片檔？如果是圖片檔，本工具無法讀取。")
         
     else:
         status_container.success(f"✅ 成功載入！共發現 {len(df)} 個單字。")
