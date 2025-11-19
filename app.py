@@ -8,19 +8,32 @@ import io
 import os
 
 # 設定頁面配置
-st.set_page_config(page_title="學測英文單字聽力生成器 v6.0", layout="wide")
+st.set_page_config(page_title="學測英文單字聽力生成器 v7.0 (錨點搜尋版)", layout="wide")
 
-# --- 核心功能 1: 解析 PDF (v6 全文掃描版) ---
+def clean_word_candidate(text):
+    """
+    清理候選文字，移除年份數字、中文、標點，只留下最像單字的英文。
+    """
+    if not text: return None
+    # 移除年份數字 (例如 05 06 10)
+    text_no_digits = re.sub(r'\d+', '', text)
+    # 移除中文
+    text_no_chinese = re.sub(r'[\u4e00-\u9fff]', '', text_no_digits)
+    # 移除常見雜訊
+    clean_text = text_no_chinese.replace("Level", "").replace("Page", "").strip()
+    
+    # 尋找最長的連續英文字串 (支援連字號 - 和單引號 ')
+    # 例如 "05 06 access" -> 抓出 "access"
+    match = re.search(r"([a-zA-Z\-\'’\s]+)", clean_text)
+    if match:
+        word = match.group(1).strip()
+        if len(word) > 1: # 排除單一字母雜訊
+            return word
+    return None
+
+# --- 核心功能 1: 解析 PDF (v7 錨點搜尋版) ---
 @st.cache_data
 def parse_pdf(pdf_path):
-    """
-    解析學測單字 PDF。
-    v6 修正：放棄表格偵測，改用「全文行掃描 (Text Line Parsing)」。
-    邏輯：
-    1. 逐行讀取文字。
-    2. 遇到「純英文行」 -> 暫存為候選單字。
-    3. 遇到「詞性標記行 ([n.]...)」 -> 將暫存單字與此行合併為一筆資料。
-    """
     data = []
     debug_logs = [] 
     
@@ -33,76 +46,70 @@ def parse_pdf(pdf_path):
             debug_logs.append(f"PDF 共有 {total_pages} 頁")
 
             for p_idx, page in enumerate(pdf.pages):
-                # 使用 extract_text 獲取純文字，這比 extract_tables 穩定得多
                 text = page.extract_text()
-                if not text:
-                    continue
+                if not text: continue
                 
                 lines = text.split('\n')
                 
-                # 1. 抓取頻率 (出現次數)
+                # 1. 抓取頻率
                 current_freq = 0
                 freq_match = re.search(r'出現次數\s*[:：]\s*(\d+)', text)
                 if freq_match:
                     current_freq = int(freq_match.group(1))
                 
-                # 2. 逐行掃描狀態機
-                pending_word = None
+                # 定義詞性錨點 (這是我們最可靠的特徵)
+                # 包含常見縮寫: v. n. adj. adv. prep. conj. pron. aux. art. num. int.
+                anchor_pattern = r'(\[\s*(v\.|n\.|adj\.|adv\.|prep\.|conj\.|pron\.|aux\.|art\.|num\.|int\.|pl\.|缩写|縮寫).*)'
                 
-                # 定義詞性 Regex (用來鎖定「解釋行」)
-                pos_pattern = r'\[\s*(v\.|n\.|adj\.|adv\.|prep\.|conj\.|pron\.|aux\.|art\.|num\.|int\.|pl\.|缩写|縮寫)'
-                
-                for line in lines:
-                    line = line.strip()
-                    if not line: continue
+                for i, line in enumerate(lines):
+                    # 搜尋這一行是否有詞性標記
+                    match = re.search(anchor_pattern, line, re.IGNORECASE)
                     
-                    # 判斷 A: 這行包含詞性標記 => 這是「解釋行」
-                    match = re.search(pos_pattern, line, re.IGNORECASE)
                     if match:
-                        word_part = ""
-                        def_part = ""
+                        # 找到錨點了！
+                        definition_part = match.group(1) # 抓出 "[n.] 之後的所有文字"
                         
-                        # 狀況 1: 單字跟解釋在同一行 (e.g. "apple [n.] 蘋果")
-                        if match.start() > 1:
-                            potential_word = line[:match.start()].strip()
-                            # 檢查前面那段是不是純英文
-                            if re.match(r"^[a-zA-Z\s\-\.\'’]+$", potential_word) and len(potential_word) > 1:
-                                word_part = potential_word
-                                def_part = line[match.start():]
+                        word = None
                         
-                        # 狀況 2: 這行只有解釋，單字在上一行 (pending_word)
-                        if not word_part and pending_word:
-                            word_part = pending_word
-                            def_part = line
-                            pending_word = None # 配對成功，清空暫存
+                        # 策略 A: 單字在同一行，位於詞性標記的左邊
+                        # 例如: "access [n.] 通道"
+                        prefix_text = line[:match.start()]
+                        word = clean_word_candidate(prefix_text)
+                        
+                        # 策略 B: 單字在上一行
+                        # 例如: 
+                        # "access"
+                        # "[n.] 通道"
+                        # 或者 "05 06 access" (有年份雜訊)
+                        if not word and i > 0:
+                            prev_line = lines[i-1]
+                            word = clean_word_candidate(prev_line)
+                            
+                        # 策略 C: 極端情況，單字在上上一行 (中間夾了年份行)
+                        if not word and i > 1:
+                            prev_prev_line = lines[i-2]
+                            # 確保上一行看起來像是年份或無意義的雜訊
+                            if re.search(r'\d+', lines[i-1]) or not lines[i-1].strip():
+                                word = clean_word_candidate(prev_prev_line)
 
-                        # 如果成功配對出單字和解釋
-                        if word_part and def_part:
-                            # 提取年份 (在解釋行或單字行尋找 05-14)
-                            # 這裡簡單處理：通常年份會跟在後面，或者我們從整頁頻率判斷
-                            years_found = re.findall(r'\b(0[5-9]|1[0-4])\b', line)
+                        if word and definition_part:
+                            # 提取年份 (尋找附近行的 05-14)
+                            # 我們搜尋當前行 + 上一行 + 下一行
+                            context_text = line
+                            if i > 0: context_text += " " + lines[i-1]
+                            if i < len(lines) - 1: context_text += " " + lines[i+1]
+                            
+                            years_found = re.findall(r'\b(0[5-9]|1[0-4])\b', context_text)
                             years_list = [int(y) + 100 for y in years_found]
                             years_list = sorted(list(set(years_list)))
                             
                             data.append({
-                                "Word": word_part,
-                                "Definition": def_part,
+                                "Word": word,
+                                "Definition": definition_part,
                                 "Frequency": current_freq,
                                 "Years": years_list,
                                 "Year_Str": ", ".join(map(str, years_list)) if years_list else "-"
                             })
-                        continue #這行處理完了，進入下一行
-
-                    # 判斷 B: 這行看起來像是「單字」 (純英文，不是標題)
-                    # 排除 "Level.3", "P1", 純數字, 包含中文的行
-                    if re.match(r"^[a-zA-Z\s\-\.\'’]+$", line):
-                        if "Level" in line or "Page" in line or "The following table" in line:
-                            continue
-                        if len(line) <= 1: # 排除單一字母雜訊
-                            continue
-                            
-                        # 是一個合法的候選單字，存起來等待下一行解釋
-                        pending_word = line
             
             debug_logs.append(f"解析完成，共提取 {len(data)} 個單字")
             
@@ -130,7 +137,7 @@ def combine_audio(playlist_df, silence_duration):
             word_sound = AudioSegment.from_file(mp3_fp, format="mp3")
             combined += word_sound + silence
         except Exception as e:
-            print(f"Error generating audio for {word}: {e}")
+            print(f"Error for {word}: {e}")
         
         my_bar.progress((i + 1) / total, text=f"正在合成: {word} ({i+1}/{total})")
             
@@ -139,7 +146,7 @@ def combine_audio(playlist_df, silence_duration):
 
 # --- 主程式介面 ---
 
-st.title("🎧 學測英文單字聽力生成器 v6.0 (全文掃描版)")
+st.title("🎧 學測英文單字聽力生成器 v7.0 (最終版)")
 
 # 1. 檔案讀取
 default_pdf = "vocabulary.pdf"
@@ -166,14 +173,8 @@ if target_file:
         with st.expander("查看詳細除錯紀錄 (Debug Log)"):
             for log in logs:
                 st.write(log)
-            st.write("---")
-            st.write("前 2 頁純文字預覽 (Text Extract):")
-            try:
-                with pdfplumber.open(target_file) as pdf:
-                    for i in range(min(2, len(pdf.pages))):
-                        st.write(f"--- Page {i+1} ---")
-                        st.text(pdf.pages[i].extract_text())
-            except: pass
+        st.info("請確認您的 PDF 是否為純圖片檔？如果是圖片檔，本工具無法讀取。")
+        
     else:
         status_container.success(f"✅ 成功載入！共發現 {len(df)} 個單字。")
         
